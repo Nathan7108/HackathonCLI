@@ -5,8 +5,9 @@
 import asyncio
 import json
 import os
+import random
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -56,6 +57,14 @@ _previous_summary: dict = {}  # for delta computation (globalThreatIndex, highPl
 _cache: dict = {}
 _cache_ttl: dict = {}
 CACHE_TTL_SECONDS = 900
+
+# --- Derived state for new dashboard endpoints (populated by _post_rebuild_hook) ---
+_previous_country_scores: dict = {}   # snapshot of _country_scores for delta detection
+_previous_sub_scores: dict = {}       # previous sub-score values for delta computation
+_alerts_history: list = []            # accumulated alerts, max 50
+_kpi_history: list = []               # daily KPI snapshots, max 30
+_gti_history: list = []               # last 5 GTI values for trend arrow
+_activity_feed: list = []             # recent activity items, max 30
 
 
 def is_cache_valid(country_code: str) -> bool:
@@ -262,6 +271,166 @@ def _score_country(code: str, info: dict, features: dict) -> dict:
     }
 
 
+# --- Sub-score dimension definitions ---
+_SUB_SCORE_DIMENSIONS = {
+    "conflictIntensity": {
+        "keys": ["acled_fatalities_30d", "acled_battle_count", "ucdp_conflict_intensity"],
+        "description": "Armed conflict and battle-related fatalities",
+    },
+    "politicalInstability": {
+        "keys": ["political_risk_score", "gdelt_goldstein_mean", "gdelt_goldstein_std"],
+        "description": "Government instability and political risk signals",
+    },
+    "economicStress": {
+        "keys": ["wb_gdp_growth_latest", "wb_inflation_latest", "econ_composite_score"],
+        "description": "Economic deterioration and fiscal pressure",
+    },
+    "socialUnrest": {
+        "keys": ["gdelt_event_count", "gdelt_event_acceleration", "gdelt_avg_tone"],
+        "description": "Protest activity and social tension indicators",
+    },
+    "sentimentEscalation": {
+        "keys": ["finbert_negative_score", "finbert_escalatory_pct", "sentiment_composite"],
+        "description": "Media sentiment and escalatory language trends",
+    },
+}
+
+
+def _detect_alerts(prev: dict, curr: dict, now: str) -> list[dict]:
+    """Compare previous and current country scores; emit alerts for significant changes."""
+    alerts = []
+    for code, c in curr.items():
+        p = prev.get(code)
+        if not p:
+            continue
+        # TIER_CHANGE: risk level changed
+        if p.get("riskLevel") != c["riskLevel"]:
+            direction = "escalated" if c["riskScore"] > p.get("riskScore", 0) else "de-escalated"
+            alerts.append({
+                "type": "TIER_CHANGE",
+                "country": c["name"],
+                "code": code,
+                "detail": f"{c['name']} {direction} from {p.get('riskLevel', '?')} to {c['riskLevel']}",
+                "time": now,
+                "severity": "high" if c["riskLevel"] in ("HIGH", "CRITICAL") else "medium",
+            })
+        # SCORE_SPIKE: score jumped by >=8 points
+        score_delta = c["riskScore"] - p.get("riskScore", 0)
+        if abs(score_delta) >= 8:
+            alerts.append({
+                "type": "SCORE_SPIKE",
+                "country": c["name"],
+                "code": code,
+                "detail": f"{c['name']} risk score changed by {score_delta:+d} (now {c['riskScore']})",
+                "time": now,
+                "severity": "high" if abs(score_delta) >= 15 else "medium",
+            })
+        # ANOMALY_DETECTED: newly flagged anomaly
+        if c["isAnomaly"] and not p.get("isAnomaly"):
+            alerts.append({
+                "type": "ANOMALY_DETECTED",
+                "country": c["name"],
+                "code": code,
+                "detail": f"Anomaly detected in {c['name']} (score {c['anomalyScore']:.2f}, severity {c['severity']})",
+                "time": now,
+                "severity": c["severity"].lower() if c.get("severity") else "medium",
+            })
+    return alerts
+
+
+def _generate_activity_items(prev: dict, curr: dict, now: str) -> list[dict]:
+    """Generate activity feed items from score changes."""
+    items = []
+    for code, c in curr.items():
+        p = prev.get(code)
+        if not p:
+            items.append({"time": now, "icon": "plus", "text": f"{c['name']} added to monitoring", "country": c['name'], "type": "new_country"})
+            continue
+        if p.get("riskLevel") != c["riskLevel"]:
+            icon = "arrow-up" if c["riskScore"] > p.get("riskScore", 0) else "arrow-down"
+            items.append({"time": now, "icon": icon, "text": f"{c['name']} moved to {c['riskLevel']}", "country": c["name"], "type": "tier_change"})
+        if c["isAnomaly"] and not p.get("isAnomaly"):
+            items.append({"time": now, "icon": "alert-triangle", "text": f"Anomaly detected in {c['name']}", "country": c["name"], "type": "anomaly"})
+        score_delta = c["riskScore"] - p.get("riskScore", 0)
+        if abs(score_delta) >= 5 and p.get("riskLevel") == c["riskLevel"]:
+            direction = "increased" if score_delta > 0 else "decreased"
+            items.append({"time": now, "icon": "trending-up" if score_delta > 0 else "trending-down",
+                          "text": f"{c['name']} risk {direction} by {abs(score_delta)} pts", "country": c["name"], "type": "score_change"})
+    return items
+
+
+def _backfill_kpi_history() -> None:
+    """Generate 30 days of synthetic KPI history using current values + gaussian noise."""
+    global _kpi_history
+    if _kpi_history:
+        return  # already backfilled
+    if not _dashboard_summary:
+        return
+    base_gti = _dashboard_summary.get("globalThreatIndex", 45)
+    base_anomalies = _dashboard_summary.get("activeAnomalies", 2)
+    base_high = _dashboard_summary.get("highPlusCountries", 3)
+    base_escalation = _dashboard_summary.get("escalationAlerts24h", 1)
+    now = datetime.utcnow()
+    for i in range(30, 0, -1):
+        day = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+        _kpi_history.append({
+            "date": day,
+            "globalThreatIndex": max(0, min(100, base_gti + int(random.gauss(0, 3)))),
+            "activeAnomalies": max(0, base_anomalies + int(random.gauss(0, 1))),
+            "highPlusCountries": max(0, base_high + int(random.gauss(0, 1))),
+            "escalationAlerts24h": max(0, base_escalation + int(random.gauss(0, 0.8))),
+        })
+
+
+def _post_rebuild_hook(country_rows: list[dict]) -> None:
+    """Called at end of _rebuild_dashboard_summary(); updates all derived state."""
+    global _previous_country_scores, _alerts_history, _activity_feed, _kpi_history, _gti_history
+    now = datetime.utcnow().isoformat() + "Z"
+
+    # Build current lookup from country_rows
+    curr = {}
+    for r in country_rows:
+        curr[r["code"]] = {
+            "name": r["name"],
+            "riskScore": r["riskScore"],
+            "riskLevel": r["riskLevel"],
+            "isAnomaly": r.get("isAnomaly", False),
+            "anomalyScore": r.get("anomalyScore", 0),
+            "severity": _country_scores.get(r["code"], {}).get("severity", "LOW"),
+        }
+
+    # Detect alerts
+    new_alerts = _detect_alerts(_previous_country_scores, curr, now)
+    _alerts_history = (new_alerts + _alerts_history)[:50]
+
+    # Generate activity items
+    new_items = _generate_activity_items(_previous_country_scores, curr, now)
+    _activity_feed = (new_items + _activity_feed)[:30]
+
+    # Backfill KPI history on first run
+    _backfill_kpi_history()
+
+    # Append today's KPI snapshot
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if not _kpi_history or _kpi_history[-1]["date"] != today:
+        _kpi_history.append({
+            "date": today,
+            "globalThreatIndex": _dashboard_summary.get("globalThreatIndex", 0),
+            "activeAnomalies": _dashboard_summary.get("activeAnomalies", 0),
+            "highPlusCountries": _dashboard_summary.get("highPlusCountries", 0),
+            "escalationAlerts24h": _dashboard_summary.get("escalationAlerts24h", 0),
+        })
+        _kpi_history = _kpi_history[-30:]
+
+    # Track GTI trend
+    gti = _dashboard_summary.get("globalThreatIndex", 0)
+    _gti_history.append(gti)
+    _gti_history[:] = _gti_history[-5:]
+
+    # Snapshot current state for next delta
+    _previous_country_scores = {k: dict(v) for k, v in curr.items()}
+
+
 def _rebuild_dashboard_summary(country_rows: list[dict]) -> None:
     """Rebuild _dashboard_summary from scored country rows."""
     global _dashboard_summary, _previous_summary
@@ -295,6 +464,9 @@ def _rebuild_dashboard_summary(country_rows: list[dict]) -> None:
     }
     _previous_summary["globalThreatIndex"] = global_threat_index
     _previous_summary["highPlusCountries"] = high_plus_countries
+
+    # Update derived state for new endpoints
+    _post_rebuild_hook(country_rows)
 
 
 async def _precompute_batch(codes: list[str]) -> list[dict]:
@@ -557,6 +729,132 @@ async def api_dashboard_summary():
     if not _dashboard_summary:
         raise HTTPException(status_code=503, detail="Scores not yet computed; wait for backend startup to finish.")
     return _dashboard_summary
+
+
+@app.get("/api/dashboard/sub-scores")
+async def api_dashboard_sub_scores():
+    """Weighted sub-score breakdown across 5 risk dimensions."""
+    if not _country_scores:
+        raise HTTPException(status_code=503, detail="Scores not yet computed; wait for backend startup to finish.")
+
+    global _previous_sub_scores
+    sub_scores = {}
+    for dim, cfg in _SUB_SCORE_DIMENSIONS.items():
+        values = []
+        drivers = []
+        for code, c in _country_scores.items():
+            feats = c.get("features", {})
+            dim_vals = [float(feats.get(k, 0)) for k in cfg["keys"]]
+            avg = sum(dim_vals) / len(dim_vals) if dim_vals else 0
+            values.append(avg)
+            if avg > 0.5:
+                drivers.append({"country": c["name"], "code": code, "value": round(avg, 2)})
+        raw_avg = sum(values) / len(values) if values else 0
+        # Normalize to 0-100 scale
+        value = round(min(100, max(0, raw_avg * 10)), 1)
+        prev_value = _previous_sub_scores.get(dim, value)
+        delta = round(value - prev_value, 1)
+        drivers_sorted = sorted(drivers, key=lambda d: d["value"], reverse=True)[:5]
+        sub_scores[dim] = {
+            "value": value,
+            "delta": delta,
+            "description": cfg["description"],
+            "drivers": drivers_sorted,
+        }
+    _previous_sub_scores = {dim: sub_scores[dim]["value"] for dim in sub_scores}
+    return {"subScores": sub_scores}
+
+
+@app.get("/api/dashboard/alerts")
+async def api_dashboard_alerts():
+    """Return accumulated alerts from score changes."""
+    return {"alerts": _alerts_history}
+
+
+@app.get("/api/dashboard/kpis")
+async def api_dashboard_kpis():
+    """Rich KPI aggregation from pre-computed country scores."""
+    if not _country_scores:
+        raise HTTPException(status_code=503, detail="Scores not yet computed; wait for backend startup to finish.")
+
+    scores = list(_country_scores.values())
+    risk_values = [c["riskScore"] for c in scores]
+    gti = round(sum(risk_values) / len(risk_values)) if risk_values else 0
+
+    prev_gti = _gti_history[-2] if len(_gti_history) >= 2 else gti
+    gti_delta = gti - prev_gti
+    if len(_gti_history) >= 3:
+        trend = "rising" if _gti_history[-1] > _gti_history[-3] else "falling" if _gti_history[-1] < _gti_history[-3] else "stable"
+    else:
+        trend = "stable"
+
+    top_contributors = sorted(scores, key=lambda c: c["riskScore"], reverse=True)[:5]
+    top_contributors_out = [{"name": c["name"], "score": c["riskScore"], "level": c["riskLevel"]} for c in top_contributors]
+
+    active_anomalies = sum(1 for c in scores if c["isAnomaly"])
+
+    risk_dist = {"CRITICAL": 0, "HIGH": 0, "MODERATE": 0, "LOW": 0}
+    for c in scores:
+        level = c["riskLevel"]
+        if level in risk_dist:
+            risk_dist[level] += 1
+
+    # Regional breakdown
+    region_map: dict[str, list] = {}
+    for code, c in _country_scores.items():
+        info = MONITORED_COUNTRIES.get(code, {})
+        region = info.get("region", "Other")
+        region_map.setdefault(region, []).append(c["riskScore"])
+    regional_breakdown = {
+        region: {"avgRisk": round(sum(vals) / len(vals), 1), "countries": len(vals)}
+        for region, vals in region_map.items()
+    }
+
+    return {
+        "globalThreatIndex": {"score": gti, "delta": gti_delta, "trend": trend, "topContributors": top_contributors_out},
+        "activeAnomalies": active_anomalies,
+        "riskDistribution": risk_dist,
+        "regionalBreakdown": regional_breakdown,
+        "totalMonitored": len(scores),
+        "computedAt": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+@app.get("/api/dashboard/kpis/history")
+async def api_dashboard_kpis_history():
+    """Return historical KPI data (30 days, synthetic backfill + live)."""
+    _backfill_kpi_history()
+    gti_values = [{"date": h["date"], "value": h["globalThreatIndex"]} for h in _kpi_history]
+    anomaly_values = [{"date": h["date"], "value": h["activeAnomalies"]} for h in _kpi_history]
+    high_values = [{"date": h["date"], "value": h["highPlusCountries"]} for h in _kpi_history]
+    escalation_values = [{"date": h["date"], "value": h["escalationAlerts24h"]} for h in _kpi_history]
+    return {
+        "globalThreatIndex": {"period": "30d", "values": gti_values},
+        "activeAnomalies": {"period": "30d", "values": anomaly_values},
+        "highPlusCountries": {"period": "30d", "values": high_values},
+        "escalationAlerts24h": {"period": "30d", "values": escalation_values},
+    }
+
+
+@app.get("/api/recent-activity")
+async def api_recent_activity():
+    """Return recent activity feed items."""
+    items = list(_activity_feed)
+    # Add tracker predictions as activity items
+    try:
+        record = tracker.get_track_record(limit=5)
+        for pred in record:
+            items.append({
+                "time": pred.get("timestamp", datetime.utcnow().isoformat() + "Z"),
+                "icon": "cpu",
+                "text": f"ML prediction logged for {pred.get('country_code', '??')} — risk {pred.get('risk_score', 0)}",
+                "country": pred.get("country_code", ""),
+                "type": "prediction",
+            })
+    except Exception:
+        pass
+    items.sort(key=lambda x: x.get("time", ""), reverse=True)
+    return {"items": items[:30]}
 
 
 @app.get("/api/track-record")
