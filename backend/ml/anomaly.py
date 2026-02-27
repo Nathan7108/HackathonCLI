@@ -230,8 +230,10 @@ def detect_anomaly(country_code: str, current_features: dict) -> dict:
     X = np.array([[current_features.get(f, 0) for f in ANOMALY_FEATURES]])
     X_scaled = scaler.transform(X)
     raw_score = model.score_samples(X_scaled)[0]
-    # Normalize to 0–1: score_samples is negative for anomalies; map to [0,1]
-    anomaly_score = max(0.0, min(1.0, (-raw_score - 0.3) / 0.7))
+    # Sigmoid normalization centered on Isolation Forest decision boundary (~-0.5)
+    # Normal data (raw > -0.5) → low score; anomalous data (raw < -0.5) → high score
+    anomaly_score = float(1.0 / (1.0 + np.exp(5.0 * (raw_score + 0.5))))
+    anomaly_score = max(0.0, min(1.0, anomaly_score))
     is_anomaly = model.predict(X_scaled)[0] == -1
 
     severity = (

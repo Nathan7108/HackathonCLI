@@ -414,8 +414,39 @@ def predict_risk(features: dict) -> dict:
     # Ordered labels matching probabilities array (model/encoder order)
     labels = list(le.inverse_transform(range(len(probabilities))))
 
-    # Weighted score from all class probabilities — semantically aligned with distribution
-    risk_score = score_from_probabilities(probabilities.tolist(), labels)
+    # --- Probability smoothing: prevent overconfident 100% predictions ---
+    n_classes = len(probabilities)
+    epsilon = 0.02
+    probabilities = probabilities * (1 - epsilon * n_classes) + epsilon
+    probabilities = probabilities / probabilities.sum()  # re-normalize
+
+    # XGBoost-based score from smoothed probabilities
+    xgb_score = score_from_probabilities(probabilities.tolist(), labels)
+
+    # --- Feature-based heuristic score for blending (prevents all-100 clustering) ---
+    fatalities = min(float(features.get("acled_fatalities_30d", 0) or 0), 5000)
+    battles = min(float(features.get("acled_battle_count", 0) or 0), 200)
+    explosions = min(float(features.get("acled_explosion_count", 0) or 0), 100)
+    protests = min(float(features.get("acled_protest_count", 0) or 0), 200)
+    goldstein = float(features.get("gdelt_goldstein_mean", 0) or 0)
+    conflict_pct = float(features.get("gdelt_conflict_pct", 0) or 0)
+    inflation = float(features.get("wb_inflation_latest", 0) or 0)
+    ucdp_deaths = float(features.get("ucdp_total_deaths", 0) or 0)
+
+    heuristic = min(100, (
+        (fatalities / 5000) * 30
+        + (battles / 200) * 20
+        + (explosions / 100) * 15
+        + (protests / 200) * 10
+        + max(0, -goldstein) * 3
+        + conflict_pct * 20
+        + min(inflation, 50) * 0.3
+        + min(ucdp_deaths / 50000, 1) * 15
+    ))
+
+    # Blend: 55% XGBoost, 45% heuristic — uses ML but grounds it in real feature magnitudes
+    risk_score = max(0, min(100, int(round(xgb_score * 0.55 + heuristic * 0.45))))
+
     # Level derived from score — ALWAYS consistent
     risk_level = level_from_score(risk_score)
 
@@ -423,11 +454,29 @@ def predict_risk(features: dict) -> dict:
     level_idx = labels.index(risk_level) if risk_level in labels else 0
     confidence = float(probabilities[level_idx])
 
-    importance = model.feature_importances_
-    top_features = sorted(
-        zip(FEATURE_COLUMNS, importance), key=lambda x: -x[1]
-    )[:5]
-    top_drivers = [str(f) for f, _ in top_features]
+    # Per-sample SHAP-like contributions via XGBoost pred_contribs
+    try:
+        booster = model.get_booster()
+        import xgboost as _xgb
+        dmat = _xgb.DMatrix(X, feature_names=FEATURE_COLUMNS)
+        contribs = booster.predict(dmat, pred_contribs=True)[0]  # shape (n_classes, n_features+1)
+        # Sum absolute contributions across classes for each feature (exclude bias term)
+        if contribs.ndim == 2:
+            per_feature = np.abs(contribs[:, :-1]).sum(axis=0)  # (n_features,)
+        else:
+            # Binary or single-output: contribs is (n_features+1,)
+            per_feature = np.abs(contribs[:-1])
+        top_features = sorted(
+            zip(FEATURE_COLUMNS, per_feature), key=lambda x: -x[1]
+        )[:5]
+        top_drivers = [str(f) for f, _ in top_features]
+    except Exception:
+        # Fallback to global importances if pred_contribs fails
+        importance = model.feature_importances_
+        top_features = sorted(
+            zip(FEATURE_COLUMNS, importance), key=lambda x: -x[1]
+        )[:5]
+        top_drivers = [str(f) for f, _ in top_features]
 
     proba_dict = {
         str(labels[i]): round(float(probabilities[i]), 3)

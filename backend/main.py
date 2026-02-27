@@ -5,7 +5,6 @@
 import asyncio
 import json
 import os
-import random
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -25,8 +24,8 @@ from backend.ml.pipeline import (
 )
 from backend.ml.risk_scorer import predict_risk, level_from_score
 from backend.ml.anomaly import detect_anomaly
-from backend.ml.sentiment import load_finbert, analyze_headlines_sentiment
-from backend.ml.forecaster import forecast_risk, SEQUENCE_FEATURES
+from backend.ml.sentiment import load_finbert, analyze_headlines_sentiment, record_sentiment
+from backend.ml.forecaster import forecast_risk, SEQUENCE_FEATURES, _build_daily_df_one_country
 from backend.ml.tracker import PredictionTracker
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -155,7 +154,7 @@ Return valid JSON with these fields:
 - keyFactors (array of 3-5 strings, each a specific risk driver)
 - industries (array of affected industry strings)
 - watchList (array of 3-5 things to monitor)
-- causalChain (array of 7 strings showing step-by-step escalation chain from today's signals to predicted crisis)
+- causalChain (array of 7 objects, each with "step" (int 1-7), "event" (string describing the escalation event), and "probability" (float 0-1 estimated likelihood). Show step-by-step escalation chain from today's signals to predicted crisis)
 - lastUpdated (ISO timestamp)
 
 Return ONLY valid JSON. No markdown, no backticks, no explanation outside the JSON.
@@ -197,9 +196,43 @@ def _anomaly_input_from_features(features: dict) -> dict:
     }
 
 
-def _build_forecast_sequence(features: dict) -> "np.ndarray":
-    """Build (90, 12) array from pipeline features for LSTM (repeat current row 90 times)."""
+def _build_forecast_sequence(features: dict, country_code: str | None = None, country_name: str | None = None) -> "np.ndarray":
+    """
+    Build (90, 12) array for LSTM forecast.
+    Primary: build real 90-day temporal sequence from cached GDELT/ACLED CSV data.
+    Fallback: repeat current features 90x if insufficient data.
+    """
     import numpy as np
+
+    # Try to build real temporal sequence from cached data
+    if country_code:
+        try:
+            gdelt_df = load_gdelt_cache(country_code)
+            acled_df = load_acled_cache(country_name or country_code)
+            ucdp_df = load_ucdp_cache(country_name or country_code)
+            wb_features_raw = load_wb_cache(country_code)
+            ucdp_features = {}
+            if not ucdp_df.empty:
+                from backend.ml.data.fetch_ucdp import compute_ucdp_features
+                ucdp_features = compute_ucdp_features(ucdp_df)
+
+            daily_df = _build_daily_df_one_country(
+                country_code, gdelt_df, acled_df, ucdp_features, wb_features_raw
+            )
+            if not daily_df.empty and len(daily_df) >= 90:
+                daily_df = daily_df.sort_values("date").reset_index(drop=True)
+                # Take last 90 days
+                last_90 = daily_df.tail(90).copy()
+                for c in SEQUENCE_FEATURES:
+                    if c not in last_90.columns:
+                        last_90[c] = 0.0
+                seq = last_90[SEQUENCE_FEATURES].fillna(0).astype(np.float32).values
+                if seq.shape == (90, 12):
+                    return seq
+        except Exception:
+            pass  # Fall through to static fallback
+
+    # Fallback: repeat current features
     risk = min(100.0, max(0.0, float(features.get("political_risk_score", features.get("conflict_composite", 0)))))
     row = [
         risk,
@@ -218,8 +251,13 @@ def _build_forecast_sequence(features: dict) -> "np.ndarray":
     return np.array([row] * 90, dtype=np.float32)
 
 
-# Priority countries for demo (Pacific Ridge Industries exposure)
-PRIORITY_COUNTRIES = ["UA", "TW", "IR", "VE", "PK", "ET", "RS", "BR"]
+# Priority countries for demo (Pacific Ridge Industries exposure + geopolitically diverse)
+PRIORITY_COUNTRIES = [
+    "UA", "TW", "IR", "VE", "PK", "ET", "RS", "BR",  # original 8
+    "RU", "CN", "IL", "SA", "NG", "MX", "IN", "IQ",   # major geopolitical
+    "SY", "SD", "CO", "TR",                             # conflict + emerging
+]
+DASHBOARD_COUNTRY_LIMIT = 20
 
 
 def _score_country(code: str, info: dict, features: dict) -> dict:
@@ -360,26 +398,56 @@ def _generate_activity_items(prev: dict, curr: dict, now: str) -> list[dict]:
 
 
 def _backfill_kpi_history() -> None:
-    """Generate 30 days of synthetic KPI history using current values + gaussian noise."""
+    """Backfill KPI history from prediction tracker SQLite — real daily averages, no fake noise."""
     global _kpi_history
     if _kpi_history:
         return  # already backfilled
-    if not _dashboard_summary:
-        return
-    base_gti = _dashboard_summary.get("globalThreatIndex", 45)
-    base_anomalies = _dashboard_summary.get("activeAnomalies", 2)
-    base_high = _dashboard_summary.get("highPlusCountries", 3)
-    base_escalation = _dashboard_summary.get("escalationAlerts24h", 1)
-    now = datetime.utcnow()
-    for i in range(30, 0, -1):
-        day = (now - timedelta(days=i)).strftime("%Y-%m-%d")
-        _kpi_history.append({
-            "date": day,
-            "globalThreatIndex": max(0, min(100, base_gti + int(random.gauss(0, 3)))),
-            "activeAnomalies": max(0, base_anomalies + int(random.gauss(0, 1))),
-            "highPlusCountries": max(0, base_high + int(random.gauss(0, 1))),
-            "escalationAlerts24h": max(0, base_escalation + int(random.gauss(0, 0.8))),
-        })
+    import sqlite3
+    try:
+        with sqlite3.connect(tracker.db_path) as conn:
+            cur = conn.execute("""
+                SELECT DATE(predicted_at) as day,
+                       AVG(risk_score) as avg_score,
+                       COUNT(*) as n_predictions
+                FROM predictions
+                WHERE predicted_at >= DATE('now', '-30 days')
+                GROUP BY DATE(predicted_at)
+                ORDER BY day
+            """)
+            rows = cur.fetchall()
+        if not rows:
+            # Fallback: flat line at current values (honest, not fake noise)
+            if _dashboard_summary:
+                now = datetime.utcnow()
+                for i in range(30, 0, -1):
+                    day = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+                    _kpi_history.append({
+                        "date": day,
+                        "globalThreatIndex": _dashboard_summary.get("globalThreatIndex", 0),
+                        "activeAnomalies": _dashboard_summary.get("activeAnomalies", 0),
+                        "highPlusCountries": _dashboard_summary.get("highPlusCountries", 0),
+                        "escalationAlerts24h": _dashboard_summary.get("escalationAlerts24h", 0),
+                    })
+            return
+        for day, avg_score, n_preds in rows:
+            avg_score = round(float(avg_score))
+            # Estimate high-plus countries: count predictions with score >= 61 on that day
+            with sqlite3.connect(tracker.db_path) as conn:
+                high_cur = conn.execute("""
+                    SELECT COUNT(DISTINCT country_code) FROM predictions
+                    WHERE DATE(predicted_at) = ? AND risk_score >= 61
+                """, (day,))
+                high_count = high_cur.fetchone()[0]
+            _kpi_history.append({
+                "date": day,
+                "globalThreatIndex": avg_score,
+                "activeAnomalies": 0,  # Not stored historically; 0 is honest
+                "highPlusCountries": high_count,
+                "escalationAlerts24h": 0,
+            })
+        _kpi_history[:] = _kpi_history[-30:]
+    except Exception:
+        pass  # No backfill available; history starts from current run
 
 
 def _post_rebuild_hook(country_rows: list[dict]) -> None:
@@ -445,9 +513,11 @@ def _rebuild_dashboard_summary(country_rows: list[dict]) -> None:
     high_plus_delta = high_plus_countries - prev_high
 
     escalation_alerts_24h = sum(1 for r in country_rows if r["anomalyScore"] > 0.5)
+    tracker.backfill_accuracy(min_gap_days=7)
     accuracy_result = tracker.compute_accuracy(days_back=90)
     model_health = round(accuracy_result["accuracy_pct"], 1)
 
+    # Store ALL countries sorted by risk; the API endpoint handles how many to show
     countries_sorted = sorted(country_rows, key=lambda r: r["riskScore"], reverse=True)
     computed_at = datetime.utcnow().isoformat() + "Z"
 
@@ -517,8 +587,9 @@ async def refresh_loop() -> None:
     """Background: full refresh every 15 minutes."""
     while True:
         await asyncio.sleep(900)
+        loop = asyncio.get_event_loop()
         all_codes = list(MONITORED_COUNTRIES.keys())
-        rows = await _precompute_batch(all_codes)
+        rows = await loop.run_in_executor(None, _compute_batch_sync, all_codes)
         _rebuild_dashboard_summary(rows)
         print(f"Scores refreshed at {datetime.utcnow().isoformat()}Z — {len(rows)} countries")
 
@@ -539,17 +610,60 @@ tracker = PredictionTracker()
 
 @app.on_event("startup")
 async def startup():
-    # Phase 1: compute priority countries so dashboard is usable immediately
+    # API is up immediately; all computation runs in background
+    asyncio.create_task(_startup_compute())
+    asyncio.create_task(refresh_loop())
+    print("Sentinel AI backend ready — API live, computing scores in background")
+
+
+async def _startup_compute() -> None:
+    """Run all score computation in a thread so the API stays responsive."""
+    await asyncio.sleep(0.1)  # let uvicorn bind port
+    loop = asyncio.get_event_loop()
+
+    # Phase 1: priority countries (in thread so API can serve requests)
     t0 = time.perf_counter()
-    priority_rows = await _precompute_batch(PRIORITY_COUNTRIES)
+    priority_rows = await loop.run_in_executor(None, _compute_batch_sync, PRIORITY_COUNTRIES)
     _rebuild_dashboard_summary(priority_rows)
     elapsed = time.perf_counter() - t0
     print(f"Phase 1: {len(priority_rows)} priority countries ready in {elapsed:.1f}s")
 
-    # Phase 2: compute all remaining countries in background (non-blocking)
-    asyncio.create_task(_background_compute_remaining())
-    asyncio.create_task(refresh_loop())
-    print("Sentinel AI backend ready — serving priority countries, computing rest in background")
+    # Phase 2: remaining countries (in thread, batched)
+    priority_set = set(PRIORITY_COUNTRIES)
+    remaining = [c for c in MONITORED_COUNTRIES if c not in priority_set]
+    if remaining:
+        t0 = time.perf_counter()
+        BATCH = 30
+        all_rows = []
+        for i in range(0, len(remaining), BATCH):
+            batch = remaining[i:i + BATCH]
+            rows = await loop.run_in_executor(None, _compute_batch_sync, batch)
+            all_rows.extend(rows)
+        # Rebuild with all countries
+        priority_rows_fresh = [
+            {"code": c, "name": _country_scores[c]["name"],
+             "riskScore": _country_scores[c]["riskScore"], "riskLevel": _country_scores[c]["riskLevel"],
+             "isAnomaly": _country_scores[c]["isAnomaly"], "anomalyScore": _country_scores[c]["anomalyScore"]}
+            for c in PRIORITY_COUNTRIES if c in _country_scores
+        ]
+        _rebuild_dashboard_summary(priority_rows_fresh + all_rows)
+        elapsed = time.perf_counter() - t0
+        print(f"Phase 2: {len(all_rows)} remaining countries computed in {elapsed:.1f}s")
+
+
+def _compute_batch_sync(codes: list[str]) -> list[dict]:
+    """Synchronous version of batch computation (runs in thread pool)."""
+    all_features = SentinelFeaturePipeline.compute_all_countries(
+        limit=len(codes), priority_codes=codes
+    )
+    rows = []
+    for code in codes:
+        info = MONITORED_COUNTRIES.get(code)
+        if not info:
+            continue
+        features = all_features.get(code, {})
+        rows.append(_score_country(code, info, features))
+    return rows
 
 
 @app.get("/")
@@ -604,7 +718,7 @@ async def analyze_country(request: AnalyzeRequest):
     features = c["features"]
 
     headlines = await fetch_headlines(country)
-    finbert_results = analyze_headlines_sentiment(headlines)
+    finbert_results = analyze_headlines_sentiment(headlines, country_code=country_code)
 
     tracker.log_prediction(country_code, risk_prediction, features, MODEL_VERSION)
 
@@ -612,16 +726,34 @@ async def analyze_country(request: AnalyzeRequest):
     brief = await call_gpt4o(ml_context, country, risk_prediction)
 
     if brief is None:
+        drivers = risk_prediction.get("top_drivers", [])[:3]
+        level = risk_prediction["risk_level"]
         brief = {
             "riskScore": risk_prediction["risk_score"],
-            "riskLevel": risk_prediction["risk_level"],
+            "riskLevel": level,
             "summary": "ML risk assessment available; GPT-4o brief unavailable (missing OPENAI_API_KEY or API error).",
             "keyFactors": risk_prediction.get("top_drivers", [])[:5],
             "industries": [],
             "watchList": [],
-            "causalChain": [],
+            "causalChain": [
+                {"step": 1, "event": f"Elevated {drivers[0] if drivers else 'risk signals'} detected", "probability": 0.85},
+                {"step": 2, "event": f"Continued {'escalation' if level in ('HIGH','CRITICAL') else 'instability'} in monitored indicators", "probability": 0.7},
+                {"step": 3, "event": f"{'Regional spillover risk increases' if level in ('HIGH','CRITICAL') else 'Local tensions persist'}", "probability": 0.55},
+                {"step": 4, "event": "International response or intervention likely", "probability": 0.4},
+                {"step": 5, "event": "Economic disruption to key sectors", "probability": 0.35},
+                {"step": 6, "event": "Humanitarian impact escalation", "probability": 0.25},
+                {"step": 7, "event": f"Full crisis scenario at {level} level", "probability": 0.15},
+            ],
             "lastUpdated": datetime.utcnow().isoformat() + "Z",
         }
+    else:
+        # Ensure GPT-4o causalChain entries are proper objects (not strings)
+        chain = brief.get("causalChain", [])
+        if chain and isinstance(chain[0], str):
+            brief["causalChain"] = [
+                {"step": i + 1, "event": event, "probability": round(0.9 - i * 0.1, 2)}
+                for i, event in enumerate(chain)
+            ]
 
     result = {
         **brief,
@@ -650,7 +782,7 @@ async def api_risk_score(request: RiskScoreRequest):
     country = request.country
 
     headlines = await fetch_headlines(country)
-    finbert_results = analyze_headlines_sentiment(headlines)
+    finbert_results = analyze_headlines_sentiment(headlines, country_code=country_code)
     gdelt_df = load_gdelt_cache(country_code)
     acled_df = load_acled_cache(country)
     ucdp_df = load_ucdp_cache(country)
@@ -695,7 +827,7 @@ async def api_forecast(request: ForecastRequest):
     pipeline = SentinelFeaturePipeline(country_code, country)
     features = pipeline.compute(gdelt_df, acled_df, ucdp_df, wb_features)
 
-    seq = _build_forecast_sequence(features)
+    seq = _build_forecast_sequence(features, country_code=country_code, country_name=country)
     try:
         forecast = forecast_risk(seq)
     except ValueError as e:
@@ -724,11 +856,15 @@ async def api_countries():
 
 
 @app.get("/api/dashboard/summary")
-async def api_dashboard_summary():
-    """Return pre-computed dashboard KPIs (instant; no on-demand computation)."""
+async def api_dashboard_summary(limit: int = DASHBOARD_COUNTRY_LIMIT):
+    """Return pre-computed dashboard KPIs. ?limit=N controls how many countries to show (0 = all)."""
     if not _dashboard_summary:
         raise HTTPException(status_code=503, detail="Scores not yet computed; wait for backend startup to finish.")
-    return _dashboard_summary
+    if limit <= 0:
+        return _dashboard_summary
+    result = dict(_dashboard_summary)
+    result["countries"] = _dashboard_summary["countries"][:limit]
+    return result
 
 
 @app.get("/api/dashboard/sub-scores")

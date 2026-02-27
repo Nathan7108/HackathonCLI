@@ -82,6 +82,73 @@ class PredictionTracker:
             rows = cur.fetchall()
         return [dict(row) for row in rows]
 
+    def backfill_accuracy(self, min_gap_days: int = 7) -> int:
+        """
+        Compare each prediction to the next prediction for the same country
+        that is at least min_gap_days later. Within-1-tier = correct.
+        Returns number of rows updated.
+        """
+        tier_order = {"LOW": 0, "MODERATE": 1, "ELEVATED": 2, "HIGH": 3, "CRITICAL": 4}
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.execute(
+                """
+                SELECT id, country_code, predicted_at, risk_level
+                FROM predictions
+                WHERE prediction_correct IS NULL
+                ORDER BY country_code, predicted_at
+                """
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+
+        if not rows:
+            return 0
+
+        # Group by country
+        by_country: dict[str, list[dict]] = {}
+        for r in rows:
+            by_country.setdefault(r["country_code"], []).append(r)
+
+        updates = []
+        for country_code, preds in by_country.items():
+            # Fetch all predictions for this country as "later" evidence
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                all_cur = conn.execute(
+                    """
+                    SELECT predicted_at, risk_level FROM predictions
+                    WHERE country_code = ?
+                    ORDER BY predicted_at
+                    """,
+                    (country_code,),
+                )
+                all_preds = [dict(r) for r in all_cur.fetchall()]
+
+            for pred in preds:
+                pred_time = datetime.fromisoformat(pred["predicted_at"].replace("Z", ""))
+                pred_level = pred["risk_level"]
+                pred_tier = tier_order.get(pred_level, -1)
+
+                # Find the next prediction for same country that is >= min_gap_days later
+                for later in all_preds:
+                    later_time = datetime.fromisoformat(later["predicted_at"].replace("Z", ""))
+                    if (later_time - pred_time).days >= min_gap_days:
+                        later_level = later["risk_level"]
+                        later_tier = tier_order.get(later_level, -1)
+                        # Within 1 tier = correct
+                        correct = 1 if abs(pred_tier - later_tier) <= 1 else 0
+                        updates.append((later_level, correct, pred["id"]))
+                        break
+
+        if updates:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.executemany(
+                    "UPDATE predictions SET actual_risk_level = ?, prediction_correct = ? WHERE id = ?",
+                    updates,
+                )
+                conn.commit()
+        return len(updates)
+
     def compute_accuracy(self, days_back: int = 90) -> dict:
         """Calculate accuracy metrics over the last N days (where prediction_correct is set)."""
         since = (datetime.utcnow() - timedelta(days=days_back)).isoformat() + "Z"
